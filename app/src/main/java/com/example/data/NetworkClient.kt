@@ -130,7 +130,7 @@ class NetworkClient {
         }
     }
 
-    // Step 1: Get Session ID (Supports fallback reuse)
+    // Step 1: Get Session ID (Blocks until server responds)
     suspend fun fetchSessionIdFromGateway(
         gatewayUrlWithMac: String,
         previousSessionId: String? = null
@@ -146,9 +146,8 @@ class NetworkClient {
             try {
                 val request = Request.Builder()
                     .url(currentUrl)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                     .build()
 
                 redirectHandlingClient.newCall(request).execute().use { response ->
@@ -181,7 +180,6 @@ class NetworkClient {
                 break
             }
         }
-        // Return fallback if fetch/extract fails
         previousSessionId
     }
 
@@ -220,7 +218,7 @@ class NetworkClient {
         }
     }
 
-    // Step 2: Download CAPTCHA Image
+    // Step 2: Download CAPTCHA Image (Blocks until downloaded)
     suspend fun downloadImage(imageUrl: String, sessionId: String): Bitmap? = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder()
@@ -241,7 +239,7 @@ class NetworkClient {
         }
     }
 
-    // Step 4: Verify CAPTCHA Response
+    // Step 4: Verify CAPTCHA Response (Blocks until verified boolean returns)
     suspend fun verifyCaptcha(sessionId: String, authCode: String): Boolean = withContext(Dispatchers.IO) {
         val url = "https://portal-as.ruijienetworks.com/api/auth/captcha/verify"
         try {
@@ -269,7 +267,7 @@ class NetworkClient {
         }
     }
 
-    // Step 5: Submit Access Code
+    // Step 5: Submit Access Code (Blocks until response body returns)
     suspend fun validateToken(
         postUrl: String,
         sessionId: String,
@@ -314,32 +312,24 @@ class NetworkClient {
         }
     }
 
-    // Step 6: Parse Response Order (Strict Evaluation)
+    // Step 6: Strict Parse Response Order
     fun parseStatus(json: String): TokenStatus {
         val normalized = json.trim()
         if (normalized.isEmpty()) return TokenStatus.UNKNOWN
 
-        // 1. logonUrl -> FOUND (SUCCESS)
         if (normalized.contains("logonUrl", ignoreCase = true)) {
             return TokenStatus.FOUND
         }
-
-        // 2. Authentication failed -> INVALID
         if (normalized.contains("Authentication failed", ignoreCase = true)) {
             return TokenStatus.INVALID
         }
-
-        // 3. STA -> USED (ALREADY_USED)
         if (normalized.contains("STA", ignoreCase = true)) {
             return TokenStatus.USED
         }
-
-        // 4. request limited -> LIMITED (RATE_LIMITED)
         if (normalized.contains("request limited", ignoreCase = true)) {
             return TokenStatus.LIMITED
         }
 
-        // 5. Fallback -> UNKNOWN
         return TokenStatus.UNKNOWN
     }
 
