@@ -55,13 +55,14 @@ class PersistentCookieJar : CookieJar {
 class NetworkClient {
 
     // ============================================================
-    // ✅ Persistent client with CookieJar
+    // ✅ Connection pooling + Cookie Jar
     // ============================================================
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .cookieJar(PersistentCookieJar())  // ✅ ဒီဟာက အရေးကြီးဆုံး!
+        .connectionPool(okhttp3.ConnectionPool(100, 5, TimeUnit.MINUTES))  // ✅ Connection Pool
+        .cookieJar(PersistentCookieJar())  // ✅ Cookie Jar
         .build()
 
     private val redirectHandlingClient = client.newBuilder()
@@ -114,12 +115,23 @@ class NetworkClient {
     }
 
     // ============================================================
-    // Step 1: Get Session ID from Gateway
+    // Step 1: Get Session ID (with previous session reuse)
     // ============================================================
-    suspend fun fetchSessionIdFromGateway(gatewayUrlWithMac: String): String? = withContext(Dispatchers.IO) {
+    suspend fun fetchSessionIdFromGateway(
+        gatewayUrlWithMac: String,
+        previousSessionId: String? = null
+    ): String? = withContext(Dispatchers.IO) {
         var currentUrl = gatewayUrlWithMac
         var redirectCount = 0
         val maxRedirects = 20
+
+        // ✅ If previous session exists, try to extract from URL first
+        if (previousSessionId != null) {
+            val extracted = extractSessionId(gatewayUrlWithMac)
+            if (extracted != null) {
+                return@withContext extracted
+            }
+        }
 
         while (redirectCount < maxRedirects) {
             var sessId = extractSessionId(currentUrl)
@@ -166,7 +178,8 @@ class NetworkClient {
                 break
             }
         }
-        null
+        // ✅ Return previous session if failed (like Python)
+        previousSessionId
     }
 
     private fun extractSessionIdFromBody(body: String): String? {
@@ -265,7 +278,7 @@ class NetworkClient {
     }
 
     // ============================================================
-    // Step 2: Download CAPTCHA Image (with proper Referer)
+    // Step 2: Download CAPTCHA Image
     // ============================================================
     suspend fun downloadImage(imageUrl: String, sessionId: String): Bitmap? = withContext(Dispatchers.IO) {
         try {
@@ -316,8 +329,7 @@ class NetworkClient {
                 if (response.isSuccessful) {
                     val bodyStr = response.body?.string() ?: "{}"
                     val json = JSONObject(bodyStr)
-                    val success = json.optBoolean("success", false)
-                    success
+                    json.optBoolean("success", false)
                 } else {
                     false
                 }
@@ -382,7 +394,7 @@ class NetworkClient {
     }
 
     // ============================================================
-    // ✅ FIXED: parseStatus() - EXACTLY like Python
+    // ✅ parseStatus() - EXACTLY like Python
     // ============================================================
     fun parseStatus(json: String): TokenStatus {
         val normalized = json.trim()
