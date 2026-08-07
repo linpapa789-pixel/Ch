@@ -5,9 +5,6 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.Cookie
-import okhttp3.CookieJar
-import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,7 +13,12 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 enum class TokenStatus {
-    FOUND, USED, INVALID, LIMITED, ERROR, UNKNOWN
+    FOUND,      // contains "logonUrl"
+    USED,       // contains "STA"
+    INVALID,    // contains "Authentication failed"
+    LIMITED,    // contains "request limited"
+    ERROR,      // network/timeout or exception
+    UNKNOWN     // other
 }
 
 data class ValidationResult(
@@ -31,36 +33,15 @@ data class BalanceDetails(
     val time: String
 )
 
-// ✅ FIX: Persistent CookieJar (ဒီ Cookie တွေကို အကုန်လုံး မျှသုံးမယ်)
-class PersistentCookieJar : CookieJar {
-    private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
-
-    @Synchronized
-    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-        val host = url.host
-        cookieStore[host] = cookieStore.getOrDefault(host, mutableListOf()).apply {
-            addAll(cookies)
-        }
-    }
-
-    @Synchronized
-    override fun loadForRequest(url: HttpUrl): List<Cookie> {
-        val host = url.host
-        return cookieStore[host] ?: emptyList()
-    }
-}
-
 class NetworkClient {
 
-    // ✅ FIX: Shared OkHttpClient with Persistent CookieJar (Python ရဲ့ session လိုပဲ)
-    private val sharedClient = OkHttpClient.Builder()
+    private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .cookieJar(PersistentCookieJar())  // ✅ Cookie တွေ အကုန်မျှသုံးမယ်
         .build()
 
-    private val redirectHandlingClient = sharedClient.newBuilder()
+    private val redirectHandlingClient = client.newBuilder()
         .followRedirects(false)
         .followSslRedirects(false)
         .build()
@@ -116,12 +97,16 @@ class NetworkClient {
 
         while (redirectCount < maxRedirects) {
             var sessId = extractSessionId(currentUrl)
-            if (sessId != null) return@withContext sessId
+            if (sessId != null) {
+                return@withContext sessId
+            }
 
             try {
                 val request = Request.Builder()
                     .url(currentUrl)
                     .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+                    .header("Accept-Language", "en-US,en;q=0.9")
                     .build()
 
                 redirectHandlingClient.newCall(request).execute().use { response ->
@@ -161,7 +146,14 @@ class NetworkClient {
     private fun extractSessionIdFromBody(body: String): String? {
         val regexes = listOf(
             Regex("(?i)sessionId\\s*=\\s*[\"']([^\"']+)[\"']"),
+            Regex("(?i)session_id\\s*=\\s*[\"']([^\"']+)[\"']"),
+            Regex("(?i)sessionKey\\s*=\\s*[\"']([^\"']+)[\"']"),
             Regex("(?i)\"sessionId\"\\s*:\\s*\"([^\"]+)\""),
+            Regex("(?i)\"session_id\"\\s*:\\s*\"([^\"]+)\""),
+            Regex("(?i)\"sessionKey\"\\s*:\\s*\"([^\"]+)\""),
+            Regex("(?i)sessionId\\s*:\\s*\"([^\"]+)\""),
+            Regex("(?i)session_id\\s*:\\s*\"([^\"]+)\""),
+            Regex("(?i)index\\.ps\\?([^\"']+)"),
             Regex("(?i)index\\.ps\\?sessionId=([^\"'&]+)")
         )
         for (regex in regexes) {
@@ -179,10 +171,11 @@ class NetworkClient {
             val request = Request.Builder()
                 .url(url)
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+                .header("Accept", "application/json, text/javascript, */*; q=0.01")
                 .header("X-Requested-With", "XMLHttpRequest")
                 .build()
 
-            sharedClient.newCall(request).execute().use { response ->
+            client.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
                     val bodyStr = response.body?.string() ?: ""
                     val json = JSONObject(bodyStr)
@@ -200,8 +193,12 @@ class NetworkClient {
                                 hours > 0 -> "${hours}h"
                                 else -> "${remMins}m"
                             }
-                        } catch (e: Exception) { "$totalMinutes min" }
-                    } else { "Unknown" }
+                        } catch (e: Exception) {
+                            "$totalMinutes min"
+                        }
+                    } else {
+                        "Unknown"
+                    }
                     
                     BalanceDetails(plan = profileName, time = timeDisplay)
                 } else {
@@ -209,6 +206,7 @@ class NetworkClient {
                 }
             }
         } catch (e: Exception) {
+            e.printStackTrace()
             BalanceDetails(plan = "Unknown", time = "Unknown")
         }
     }
@@ -230,7 +228,9 @@ class NetworkClient {
             if (url.contains("sessionId=", ignoreCase = true)) {
                 val match = Regex("(?i)sessionId=([^&]+)").find(url)
                 match?.groupValues?.get(1)
-            } else { null }
+            } else {
+                null
+            }
         }
     }
 
@@ -239,48 +239,24 @@ class NetworkClient {
             val request = Request.Builder()
                 .url(imageUrl)
                 .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
+                .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
                 .build()
 
-            // ✅ Use sharedClient (so cookies from gateway are sent!)
-            sharedClient.newCall(request).execute().use { response ->
+            client.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
-                    val bytes = response.body?.bytes() ?: return@withContext null
+                    val body = response.body ?: return@withContext null
+                    val bytes = body.bytes()
                     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                } else { null }
+                } else {
+                    null
+                }
             }
-        } catch (e: Exception) { null }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
     }
 
-    // ✅ FIX: verifyCaptcha also uses sharedClient
-    suspend fun verifyCaptcha(sessionId: String, authCode: String): Boolean = withContext(Dispatchers.IO) {
-        val url = "https://portal-as.ruijienetworks.com/api/auth/captcha/verify"
-        try {
-            val jsonObject = JSONObject().apply {
-                put("sessionId", sessionId)
-                put("authCode", authCode)
-            }
-            val requestBody = jsonObject.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-
-            val request = Request.Builder()
-                .url(url)
-                .post(requestBody)
-                .header("Content-Type", "application/json")
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36")
-                .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId=$sessionId")
-                .build()
-
-            // ✅ Use sharedClient
-            sharedClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val bodyStr = response.body?.string() ?: "{}"
-                    val json = JSONObject(bodyStr)
-                    json.optBoolean("success", false)
-                } else { false }
-            }
-        } catch (e: Exception) { false }
-    }
-
-    // ✅ FIX: validateToken also uses sharedClient
     suspend fun validateToken(
         postUrl: String,
         sessionId: String,
@@ -295,7 +271,8 @@ class NetworkClient {
                 put("apiVersion", 1)
             }
 
-            val requestBody = jsonObject.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+            val mediaType = "application/json; charset=utf-8".toMediaType()
+            val requestBody = jsonObject.toString().toRequestBody(mediaType)
 
             val request = Request.Builder()
                 .url(postUrl)
@@ -305,36 +282,97 @@ class NetworkClient {
                 .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId=$sessionId")
                 .build()
 
-            // ✅ Use sharedClient
-            sharedClient.newCall(request).execute().use { response ->
+            client.newCall(request).execute().use { response ->
                 val rawBody = response.body?.string() ?: ""
                 val httpCode = response.code
+                val isSuccessHttp = response.isSuccessful
+
                 val status = parseStatus(rawBody)
-                ValidationResult(status, rawBody, response.isSuccessful, httpCode)
+
+                ValidationResult(
+                    status = status,
+                    rawResponse = rawBody,
+                    isSuccessfulHttp = isSuccessHttp,
+                    httpCode = httpCode
+                )
             }
         } catch (e: Exception) {
-            ValidationResult(TokenStatus.ERROR, e.message ?: "Network error", false, 0)
+            e.printStackTrace()
+            ValidationResult(
+                status = TokenStatus.ERROR,
+                rawResponse = e.message ?: "Network error occurred",
+                isSuccessfulHttp = false,
+                httpCode = 0
+            )
         }
     }
 
+    // ============================================================
+    // ✅ FIXED: parseStatus() - EXACTLY like Python Tool
+    //    Order matters! Check INVALID (Authentication failed) 
+    //    BEFORE USED (STA)
+    // ============================================================
     fun parseStatus(json: String): TokenStatus {
         val normalized = json.trim()
         if (normalized.isEmpty()) return TokenStatus.UNKNOWN
 
-        if (normalized.contains("logonUrl", ignoreCase = true)) return TokenStatus.FOUND
-        if (normalized.contains("STA", ignoreCase = true)) return TokenStatus.USED
-        if (normalized.contains("Authentication failed", ignoreCase = true)) return TokenStatus.INVALID
-        if (normalized.contains("request limited", ignoreCase = true)) return TokenStatus.LIMITED
+        // 1. Check FOUND first (like Python)
+        if (normalized.contains("logonUrl", ignoreCase = true)) {
+            return TokenStatus.FOUND
+        }
+        
+        // 2. ✅ FIXED: Check INVALID BEFORE USED (like Python)
+        if (normalized.contains("Authentication failed", ignoreCase = true)) {
+            return TokenStatus.INVALID
+        }
+        
+        // 3. Check USED (STA)
+        if (normalized.contains("STA", ignoreCase = true)) {
+            return TokenStatus.USED
+        }
+        
+        // 4. Check LIMITED
+        if (normalized.contains("request limited", ignoreCase = true)) {
+            return TokenStatus.LIMITED
+        }
 
+        // 5. Try JSON parsing for nested messages (like Python's fallback)
         try {
             val obj = JSONObject(json)
+            
+            // Check message field first
             val message = obj.optString("message", "").lowercase()
+            
+            if (message.contains("authentication failed")) {
+                return TokenStatus.INVALID
+            }
+            if (message.contains("request limited")) {
+                return TokenStatus.LIMITED
+            }
+            if (message.contains("sta")) {
+                return TokenStatus.USED
+            }
+            if (message.contains("logonurl")) {
+                return TokenStatus.FOUND
+            }
+            
+            // Check result field
             val result = obj.optString("result", "").lowercase()
-            if (message.contains("authentication failed") || result.contains("authentication failed")) return TokenStatus.INVALID
-            if (message.contains("sta") || result.contains("sta")) return TokenStatus.USED
-            if (message.contains("request limited") || result.contains("request limited")) return TokenStatus.LIMITED
-            if (message.contains("logonurl") || result.contains("logonurl")) return TokenStatus.FOUND
-        } catch (_: Exception) {}
+            if (result.contains("authentication failed")) {
+                return TokenStatus.INVALID
+            }
+            if (result.contains("request limited")) {
+                return TokenStatus.LIMITED
+            }
+            if (result.contains("sta")) {
+                return TokenStatus.USED
+            }
+            if (result.contains("logonurl")) {
+                return TokenStatus.FOUND
+            }
+        } catch (e: Exception) {
+            // Fall through to raw text scanning
+        }
 
         return TokenStatus.UNKNOWN
     }
