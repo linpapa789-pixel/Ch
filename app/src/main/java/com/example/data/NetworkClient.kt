@@ -5,6 +5,9 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -13,12 +16,12 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 enum class TokenStatus {
-    FOUND,      // contains "logonUrl"
-    USED,       // contains "STA"
-    INVALID,    // contains "Authentication failed"
-    LIMITED,    // contains "request limited"
-    ERROR,      // network/timeout or exception
-    UNKNOWN     // other
+    FOUND,
+    USED,
+    INVALID,
+    LIMITED,
+    ERROR,
+    UNKNOWN
 }
 
 data class ValidationResult(
@@ -33,12 +36,32 @@ data class BalanceDetails(
     val time: String
 )
 
+// ============================================================
+// ✅ Cookie Jar - like Python's requests.Session()
+// ============================================================
+class PersistentCookieJar : CookieJar {
+    private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
+
+    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        val host = url.host
+        cookieStore[host] = cookies.toMutableList()
+    }
+
+    override fun loadForRequest(url: HttpUrl): List<Cookie> {
+        return cookieStore[url.host] ?: emptyList()
+    }
+}
+
 class NetworkClient {
 
+    // ============================================================
+    // ✅ Persistent client with CookieJar
+    // ============================================================
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
+        .cookieJar(PersistentCookieJar())  // ✅ ဒီဟာက အရေးကြီးဆုံး!
         .build()
 
     private val redirectHandlingClient = client.newBuilder()
@@ -90,6 +113,9 @@ class NetworkClient {
         }
     }
 
+    // ============================================================
+    // Step 1: Get Session ID from Gateway
+    // ============================================================
     suspend fun fetchSessionIdFromGateway(gatewayUrlWithMac: String): String? = withContext(Dispatchers.IO) {
         var currentUrl = gatewayUrlWithMac
         var redirectCount = 0
@@ -165,6 +191,9 @@ class NetworkClient {
         return null
     }
 
+    // ============================================================
+    // Step 6: Get Balance Details
+    // ============================================================
     suspend fun getBalanceDetails(sessionId: String): BalanceDetails = withContext(Dispatchers.IO) {
         val url = "https://portal-as.ruijienetworks.com/api/auth/balance/getBalance/$sessionId"
         try {
@@ -173,6 +202,7 @@ class NetworkClient {
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
                 .header("Accept", "application/json, text/javascript, */*; q=0.01")
                 .header("X-Requested-With", "XMLHttpRequest")
+                .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/balance.html?sessionId=$sessionId")
                 .build()
 
             client.newCall(request).execute().use { response ->
@@ -234,13 +264,16 @@ class NetworkClient {
         }
     }
 
-    suspend fun downloadImage(imageUrl: String): Bitmap? = withContext(Dispatchers.IO) {
+    // ============================================================
+    // Step 2: Download CAPTCHA Image (with proper Referer)
+    // ============================================================
+    suspend fun downloadImage(imageUrl: String, sessionId: String): Bitmap? = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder()
                 .url(imageUrl)
                 .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
                 .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
-                .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html")
+                .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId=$sessionId")
                 .build()
 
             client.newCall(request).execute().use { response ->
@@ -259,8 +292,7 @@ class NetworkClient {
     }
 
     // ============================================================
-    // ✅ FIXED: verifyCaptcha() - EXACTLY like Python tool
-    //    Proper headers and referer
+    // Step 4: Verify CAPTCHA
     // ============================================================
     suspend fun verifyCaptcha(sessionId: String, authCode: String): Boolean = withContext(Dispatchers.IO) {
         val url = "https://portal-as.ruijienetworks.com/api/auth/captcha/verify"
@@ -285,8 +317,6 @@ class NetworkClient {
                     val bodyStr = response.body?.string() ?: "{}"
                     val json = JSONObject(bodyStr)
                     val success = json.optBoolean("success", false)
-                    // Log the response for debugging
-                    android.util.Log.d("NetworkClient", "CAPTCHA verify: success=$success, body=$bodyStr")
                     success
                 } else {
                     false
@@ -298,6 +328,9 @@ class NetworkClient {
         }
     }
 
+    // ============================================================
+    // Step 5: Check Voucher
+    // ============================================================
     suspend fun validateToken(
         postUrl: String,
         sessionId: String,
@@ -349,38 +382,35 @@ class NetworkClient {
     }
 
     // ============================================================
-    // ✅ FIXED: parseStatus() - EXACTLY like Python Tool
-    //    Order: FOUND -> INVALID -> USED -> LIMITED
+    // ✅ FIXED: parseStatus() - EXACTLY like Python
     // ============================================================
     fun parseStatus(json: String): TokenStatus {
         val normalized = json.trim()
         if (normalized.isEmpty()) return TokenStatus.UNKNOWN
 
-        // 1. Check FOUND first (logonUrl)
+        // 1. FOUND
         if (normalized.contains("logonUrl", ignoreCase = true)) {
             return TokenStatus.FOUND
         }
         
-        // 2. Check INVALID (Authentication failed) - BEFORE USED
+        // 2. INVALID (check before USED)
         if (normalized.contains("Authentication failed", ignoreCase = true)) {
             return TokenStatus.INVALID
         }
         
-        // 3. Check USED (STA)
+        // 3. USED
         if (normalized.contains("STA", ignoreCase = true)) {
             return TokenStatus.USED
         }
         
-        // 4. Check LIMITED (request limited)
+        // 4. LIMITED
         if (normalized.contains("request limited", ignoreCase = true)) {
             return TokenStatus.LIMITED
         }
 
-        // 5. Try JSON parsing for nested messages (like Python's fallback)
+        // 5. JSON fallback
         try {
             val obj = JSONObject(json)
-            
-            // Check message field first
             val message = obj.optString("message", "").lowercase()
             
             if (message.contains("authentication failed")) {
@@ -395,23 +425,8 @@ class NetworkClient {
             if (message.contains("logonurl")) {
                 return TokenStatus.FOUND
             }
-            
-            // Check result field
-            val result = obj.optString("result", "").lowercase()
-            if (result.contains("authentication failed")) {
-                return TokenStatus.INVALID
-            }
-            if (result.contains("request limited")) {
-                return TokenStatus.LIMITED
-            }
-            if (result.contains("sta")) {
-                return TokenStatus.USED
-            }
-            if (result.contains("logonurl")) {
-                return TokenStatus.FOUND
-            }
         } catch (e: Exception) {
-            // Fall through to raw text scanning
+            // Fall through
         }
 
         return TokenStatus.UNKNOWN
