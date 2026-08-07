@@ -5,6 +5,9 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -13,12 +16,7 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 enum class TokenStatus {
-    FOUND,      // contains "logonUrl"
-    USED,       // contains "STA"
-    INVALID,    // contains "Authentication failed"
-    LIMITED,    // contains "request limited"
-    ERROR,      // network/timeout or exception
-    UNKNOWN     // other
+    FOUND, USED, INVALID, LIMITED, ERROR, UNKNOWN
 }
 
 data class ValidationResult(
@@ -33,22 +31,40 @@ data class BalanceDetails(
     val time: String
 )
 
+// ✅ FIX: Persistent CookieJar (ဒီ Cookie တွေကို အကုန်လုံး မျှသုံးမယ်)
+class PersistentCookieJar : CookieJar {
+    private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
+
+    @Synchronized
+    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        val host = url.host
+        cookieStore[host] = cookieStore.getOrDefault(host, mutableListOf()).apply {
+            addAll(cookies)
+        }
+    }
+
+    @Synchronized
+    override fun loadForRequest(url: HttpUrl): List<Cookie> {
+        val host = url.host
+        return cookieStore[host] ?: emptyList()
+    }
+}
+
 class NetworkClient {
 
-    private val client = OkHttpClient.Builder()
+    // ✅ FIX: Shared OkHttpClient with Persistent CookieJar (Python ရဲ့ session လိုပဲ)
+    private val sharedClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
+        .cookieJar(PersistentCookieJar())  // ✅ Cookie တွေ အကုန်မျှသုံးမယ်
         .build()
 
-    private val redirectHandlingClient = client.newBuilder()
+    private val redirectHandlingClient = sharedClient.newBuilder()
         .followRedirects(false)
         .followSslRedirects(false)
         .build()
 
-    /**
-     * Generates a random MAC address in the standard uppercase format (XX:XX:XX:XX:XX:XX)
-     */
     fun generateRandomMac(): String {
         val chars = "0123456789ABCDEF"
         return (1..6).joinToString(":") {
@@ -56,9 +72,6 @@ class NetworkClient {
         }
     }
 
-    /**
-     * Replaces or appends the "mac" parameter in the URL with the new MAC address.
-     */
     fun replaceMacInUrl(url: String, newMac: String): String {
         if (url.isBlank()) return url
         return try {
@@ -96,9 +109,6 @@ class NetworkClient {
         }
     }
 
-    /**
-     * Fetches a new sessionId by making a GET request to the gateway URL and manually following redirects.
-     */
     suspend fun fetchSessionIdFromGateway(gatewayUrlWithMac: String): String? = withContext(Dispatchers.IO) {
         var currentUrl = gatewayUrlWithMac
         var redirectCount = 0
@@ -106,16 +116,12 @@ class NetworkClient {
 
         while (redirectCount < maxRedirects) {
             var sessId = extractSessionId(currentUrl)
-            if (sessId != null) {
-                return@withContext sessId
-            }
+            if (sessId != null) return@withContext sessId
 
             try {
                 val request = Request.Builder()
                     .url(currentUrl)
                     .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-                    .header("Accept-Language", "en-US,en;q=0.9")
                     .build()
 
                 redirectHandlingClient.newCall(request).execute().use { response ->
@@ -155,14 +161,7 @@ class NetworkClient {
     private fun extractSessionIdFromBody(body: String): String? {
         val regexes = listOf(
             Regex("(?i)sessionId\\s*=\\s*[\"']([^\"']+)[\"']"),
-            Regex("(?i)session_id\\s*=\\s*[\"']([^\"']+)[\"']"),
-            Regex("(?i)sessionKey\\s*=\\s*[\"']([^\"']+)[\"']"),
             Regex("(?i)\"sessionId\"\\s*:\\s*\"([^\"]+)\""),
-            Regex("(?i)\"session_id\"\\s*:\\s*\"([^\"]+)\""),
-            Regex("(?i)\"sessionKey\"\\s*:\\s*\"([^\"]+)\""),
-            Regex("(?i)sessionId\\s*:\\s*\"([^\"]+)\""),
-            Regex("(?i)session_id\\s*:\\s*\"([^\"]+)\""),
-            Regex("(?i)index\\.ps\\?([^\"']+)"),
             Regex("(?i)index\\.ps\\?sessionId=([^\"'&]+)")
         )
         for (regex in regexes) {
@@ -174,30 +173,23 @@ class NetworkClient {
         return null
     }
 
-    /**
-     * Calls balance API and extracts plan name and time remaining.
-     * FIXED: Uses "result" object (like Python), formats time as "Xh Ym" or "Xm".
-     */
     suspend fun getBalanceDetails(sessionId: String): BalanceDetails = withContext(Dispatchers.IO) {
         val url = "https://portal-as.ruijienetworks.com/api/auth/balance/getBalance/$sessionId"
         try {
             val request = Request.Builder()
                 .url(url)
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
-                .header("Accept", "application/json, text/javascript, */*; q=0.01")
                 .header("X-Requested-With", "XMLHttpRequest")
                 .build()
 
-            client.newCall(request).execute().use { response ->
+            sharedClient.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
                     val bodyStr = response.body?.string() ?: ""
                     val json = JSONObject(bodyStr)
-                    // FIXED: Use "result" (like Python) not "data"
                     val resultObj = json.optJSONObject("result") ?: json
                     val profileName = resultObj.optString("profileName", "Unknown")
                     val totalMinutes = resultObj.optString("totalMinutes", "Unknown")
                     
-                    // FIXED: Format time like Python (hours/minutes)
                     val timeDisplay = if (totalMinutes != "Unknown") {
                         try {
                             val mins = totalMinutes.toInt()
@@ -208,12 +200,8 @@ class NetworkClient {
                                 hours > 0 -> "${hours}h"
                                 else -> "${remMins}m"
                             }
-                        } catch (e: Exception) {
-                            "$totalMinutes min"
-                        }
-                    } else {
-                        "Unknown"
-                    }
+                        } catch (e: Exception) { "$totalMinutes min" }
+                    } else { "Unknown" }
                     
                     BalanceDetails(plan = profileName, time = timeDisplay)
                 } else {
@@ -221,14 +209,10 @@ class NetworkClient {
                 }
             }
         } catch (e: Exception) {
-            e.printStackTrace()
             BalanceDetails(plan = "Unknown", time = "Unknown")
         }
     }
 
-    /**
-     * Extracts sessionId from a URL.
-     */
     fun extractSessionId(url: String): String? {
         if (url.isBlank()) return null
         return try {
@@ -246,41 +230,28 @@ class NetworkClient {
             if (url.contains("sessionId=", ignoreCase = true)) {
                 val match = Regex("(?i)sessionId=([^&]+)").find(url)
                 match?.groupValues?.get(1)
-            } else {
-                null
-            }
+            } else { null }
         }
     }
 
-    /**
-     * Downloads an image from the server.
-     */
     suspend fun downloadImage(imageUrl: String): Bitmap? = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder()
                 .url(imageUrl)
                 .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
-                .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
                 .build()
 
-            client.newCall(request).execute().use { response ->
+            // ✅ Use sharedClient (so cookies from gateway are sent!)
+            sharedClient.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
-                    val body = response.body ?: return@withContext null
-                    val bytes = body.bytes()
+                    val bytes = response.body?.bytes() ?: return@withContext null
                     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                } else {
-                    null
-                }
+                } else { null }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        }
+        } catch (e: Exception) { null }
     }
 
-    // ============================================================
-    // 🟢 NEW FUNCTION: Verify CAPTCHA separately (FIX)
-    // ============================================================
+    // ✅ FIX: verifyCaptcha also uses sharedClient
     suspend fun verifyCaptcha(sessionId: String, authCode: String): Boolean = withContext(Dispatchers.IO) {
         val url = "https://portal-as.ruijienetworks.com/api/auth/captcha/verify"
         try {
@@ -288,8 +259,7 @@ class NetworkClient {
                 put("sessionId", sessionId)
                 put("authCode", authCode)
             }
-            val mediaType = "application/json; charset=utf-8".toMediaType()
-            val requestBody = jsonObject.toString().toRequestBody(mediaType)
+            val requestBody = jsonObject.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
 
             val request = Request.Builder()
                 .url(url)
@@ -299,25 +269,18 @@ class NetworkClient {
                 .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId=$sessionId")
                 .build()
 
-            client.newCall(request).execute().use { response ->
+            // ✅ Use sharedClient
+            sharedClient.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
                     val bodyStr = response.body?.string() ?: "{}"
                     val json = JSONObject(bodyStr)
                     json.optBoolean("success", false)
-                } else {
-                    false
-                }
+                } else { false }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            false
-        }
+        } catch (e: Exception) { false }
     }
 
-    /**
-     * Sends the token, sessionId, and extracted CAPTCHA text via POST request.
-     * FIXED: Uses Python-compatible JSON keys: sessionId, authCode, accessCode, apiVersion.
-     */
+    // ✅ FIX: validateToken also uses sharedClient
     suspend fun validateToken(
         postUrl: String,
         sessionId: String,
@@ -325,7 +288,6 @@ class NetworkClient {
         accessCode: String
     ): ValidationResult = withContext(Dispatchers.IO) {
         try {
-            // FIXED: JSON keys match Python exactly
             val jsonObject = JSONObject().apply {
                 put("sessionId", sessionId)
                 put("authCode", authCode)
@@ -333,8 +295,7 @@ class NetworkClient {
                 put("apiVersion", 1)
             }
 
-            val mediaType = "application/json; charset=utf-8".toMediaType()
-            val requestBody = jsonObject.toString().toRequestBody(mediaType)
+            val requestBody = jsonObject.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
 
             val request = Request.Builder()
                 .url(postUrl)
@@ -344,77 +305,36 @@ class NetworkClient {
                 .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId=$sessionId")
                 .build()
 
-            client.newCall(request).execute().use { response ->
+            // ✅ Use sharedClient
+            sharedClient.newCall(request).execute().use { response ->
                 val rawBody = response.body?.string() ?: ""
                 val httpCode = response.code
-                val isSuccessHttp = response.isSuccessful
-
                 val status = parseStatus(rawBody)
-
-                ValidationResult(
-                    status = status,
-                    rawResponse = rawBody,
-                    isSuccessfulHttp = isSuccessHttp,
-                    httpCode = httpCode
-                )
+                ValidationResult(status, rawBody, response.isSuccessful, httpCode)
             }
         } catch (e: Exception) {
-            e.printStackTrace()
-            ValidationResult(
-                status = TokenStatus.ERROR,
-                rawResponse = e.message ?: "Network error occurred",
-                isSuccessfulHttp = false,
-                httpCode = 0
-            )
+            ValidationResult(TokenStatus.ERROR, e.message ?: "Network error", false, 0)
         }
     }
 
-    /**
-     * Parses the server response and categorizes.
-     * FIXED: Handles all Python cases exactly.
-     */
     fun parseStatus(json: String): TokenStatus {
         val normalized = json.trim()
         if (normalized.isEmpty()) return TokenStatus.UNKNOWN
 
-        // Python: if 'logonUrl' in resp_text → found
-        if (normalized.contains("logonUrl", ignoreCase = true)) {
-            return TokenStatus.FOUND
-        }
-        // Python: if 'STA' in resp_text → used
-        if (normalized.contains("STA", ignoreCase = true)) {
-            return TokenStatus.USED
-        }
-        // Python: if 'Authentication failed' in resp_text → invalid
-        if (normalized.contains("Authentication failed", ignoreCase = true)) {
-            return TokenStatus.INVALID
-        }
-        // Python: if 'request limited' in resp_text → limited
-        if (normalized.contains("request limited", ignoreCase = true)) {
-            return TokenStatus.LIMITED
-        }
+        if (normalized.contains("logonUrl", ignoreCase = true)) return TokenStatus.FOUND
+        if (normalized.contains("STA", ignoreCase = true)) return TokenStatus.USED
+        if (normalized.contains("Authentication failed", ignoreCase = true)) return TokenStatus.INVALID
+        if (normalized.contains("request limited", ignoreCase = true)) return TokenStatus.LIMITED
 
-        // Try JSON parsing for nested messages (like Python's fallback)
         try {
             val obj = JSONObject(json)
             val message = obj.optString("message", "").lowercase()
             val result = obj.optString("result", "").lowercase()
-            
-            if (message.contains("authentication failed") || result.contains("authentication failed")) {
-                return TokenStatus.INVALID
-            }
-            if (message.contains("sta") || result.contains("sta")) {
-                return TokenStatus.USED
-            }
-            if (message.contains("request limited") || result.contains("request limited")) {
-                return TokenStatus.LIMITED
-            }
-            if (message.contains("logonurl") || result.contains("logonurl")) {
-                return TokenStatus.FOUND
-            }
-        } catch (e: Exception) {
-            // Fall through to raw text scanning
-        }
+            if (message.contains("authentication failed") || result.contains("authentication failed")) return TokenStatus.INVALID
+            if (message.contains("sta") || result.contains("sta")) return TokenStatus.USED
+            if (message.contains("request limited") || result.contains("request limited")) return TokenStatus.LIMITED
+            if (message.contains("logonurl") || result.contains("logonurl")) return TokenStatus.FOUND
+        } catch (_: Exception) {}
 
         return TokenStatus.UNKNOWN
     }
