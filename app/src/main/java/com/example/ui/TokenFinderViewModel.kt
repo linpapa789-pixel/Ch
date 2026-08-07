@@ -79,7 +79,6 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     private val _postUrl = MutableStateFlow("https://portal-as.ruijienetworks.com/api/auth/voucher/?lang=en_US")
     val postUrl = _postUrl.asStateFlow()
 
-    // Missing JSON Keys added for TokenFinderScreen
     private val _keySession = MutableStateFlow("sessionId")
     val keySession = _keySession.asStateFlow()
 
@@ -177,7 +176,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
             val newMac = networkClient.generateRandomMac()
             val updatedUrl = networkClient.replaceMacInUrl(currentUrl, newMac)
             _gatewayUrl.value = updatedUrl
-            
+
             val newSessionId = networkClient.fetchSessionIdFromGateway(updatedUrl, null)
             if (newSessionId != null) {
                 _sessionId.value = newSessionId
@@ -231,6 +230,10 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         }
     }
 
+    /**
+     * Strict Sequential Execution Worker
+     * Executes Step 1 -> Step 6 synchronously. Blocks until Response returns before taking next token.
+     */
     private suspend fun runWorker(
         workerId: Int,
         sharedCounter: java.util.concurrent.atomic.AtomicInteger
@@ -250,6 +253,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
 
                 while (retryAttempt < maxAttempts && !done && _isProcessing.value) {
 
+                    // Step 1: Get Session (Suspends until Server Response)
                     val currentUrl = _gatewayUrl.value
                     val newMac = networkClient.generateRandomMac()
                     val updatedUrl = networkClient.replaceMacInUrl(currentUrl, newMac)
@@ -257,13 +261,14 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                     val sessionId = networkClient.fetchSessionIdFromGateway(updatedUrl, previousSessionId)
                     if (sessionId == null) {
                         retryAttempt++
-                        delay(1000)
+                        delay(1500)
                         continue
                     }
 
                     previousSessionId = sessionId
                     _sessionId.value = sessionId
 
+                    // Step 2 & 3: CAPTCHA Download & Verify (Suspends until Server Response)
                     var captchaVerified = false
                     var extractedText = ""
 
@@ -280,6 +285,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                             extractedText = if (ocrResult.isNotBlank()) ocrResult else "A1B2"
                             _currentCaptchaText.value = extractedText
 
+                            // Verify CAPTCHA with Server
                             val isVerified = networkClient.verifyCaptcha(sessionId, extractedText)
                             if (isVerified) {
                                 captchaVerified = true
@@ -295,6 +301,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                         continue
                     }
 
+                    // Step 5: Submit Access Code (Suspends until Server Response)
                     val result = networkClient.validateToken(
                         postUrl = _postUrl.value,
                         sessionId = sessionId,
@@ -310,6 +317,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                         rawResponse = result.rawResponse
                     )
 
+                    // Step 6: Handle Server Response
                     when (result.status) {
                         TokenStatus.FOUND -> {
                             addLog("[Worker-$workerId] SUCCESS: $token", LogType.SUCCESS)
@@ -342,7 +350,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
                         TokenStatus.LIMITED -> {
                             addLog("[Worker-$workerId] RATE LIMITED: $token (sleeping 2s...)", LogType.WARNING)
                             _limitedCount.value++
-                            delay(2000)
+                            delay(2000) // Sleep 2 seconds on rate limit
                             retryAttempt++
                         }
 
@@ -411,7 +419,6 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         addLog("Scanning STOPPED.", LogType.WARNING)
     }
 
-    // --- Logging & Mock Helpers ---
     fun addLog(message: String, type: LogType) {
         viewModelScope.launch {
             _logs.value = (_logs.value + LogEntry(message = message, type = type)).takeLast(100)
@@ -422,7 +429,6 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         _logs.value = emptyList()
     }
 
-    // Correct Parameter order matching ServerResponseLog data class
     fun addServerResponseLog(
         workerId: Int,
         token: String,
@@ -474,7 +480,6 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     }
 }
 
-// ViewModelFactory required by MainActivity.kt
 class TokenFinderViewModelFactory(
     private val repository: TokenRepository
 ) : ViewModelProvider.Factory {
