@@ -1,0 +1,6 @@
+{
+  "name": "Session Token Finder",
+  "description": "A native Android application designed to download challenge images, perform OCR, and discover valid session tokens securely.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
