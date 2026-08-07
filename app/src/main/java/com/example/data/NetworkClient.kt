@@ -240,6 +240,7 @@ class NetworkClient {
                 .url(imageUrl)
                 .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
                 .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+                .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html")
                 .build()
 
             client.newCall(request).execute().use { response ->
@@ -254,6 +255,46 @@ class NetworkClient {
         } catch (e: Exception) {
             e.printStackTrace()
             null
+        }
+    }
+
+    // ============================================================
+    // ✅ FIXED: verifyCaptcha() - EXACTLY like Python tool
+    //    Proper headers and referer
+    // ============================================================
+    suspend fun verifyCaptcha(sessionId: String, authCode: String): Boolean = withContext(Dispatchers.IO) {
+        val url = "https://portal-as.ruijienetworks.com/api/auth/captcha/verify"
+        try {
+            val jsonObject = JSONObject().apply {
+                put("sessionId", sessionId)
+                put("authCode", authCode)
+            }
+            val mediaType = "application/json; charset=utf-8".toMediaType()
+            val requestBody = jsonObject.toString().toRequestBody(mediaType)
+
+            val request = Request.Builder()
+                .url(url)
+                .post(requestBody)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
+                .header("Referer", "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId=$sessionId")
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    val bodyStr = response.body?.string() ?: "{}"
+                    val json = JSONObject(bodyStr)
+                    val success = json.optBoolean("success", false)
+                    // Log the response for debugging
+                    android.util.Log.d("NetworkClient", "CAPTCHA verify: success=$success, body=$bodyStr")
+                    success
+                } else {
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
         }
     }
 
@@ -309,19 +350,18 @@ class NetworkClient {
 
     // ============================================================
     // ✅ FIXED: parseStatus() - EXACTLY like Python Tool
-    //    Order matters! Check INVALID (Authentication failed) 
-    //    BEFORE USED (STA)
+    //    Order: FOUND -> INVALID -> USED -> LIMITED
     // ============================================================
     fun parseStatus(json: String): TokenStatus {
         val normalized = json.trim()
         if (normalized.isEmpty()) return TokenStatus.UNKNOWN
 
-        // 1. Check FOUND first (like Python)
+        // 1. Check FOUND first (logonUrl)
         if (normalized.contains("logonUrl", ignoreCase = true)) {
             return TokenStatus.FOUND
         }
         
-        // 2. ✅ FIXED: Check INVALID BEFORE USED (like Python)
+        // 2. Check INVALID (Authentication failed) - BEFORE USED
         if (normalized.contains("Authentication failed", ignoreCase = true)) {
             return TokenStatus.INVALID
         }
@@ -331,7 +371,7 @@ class NetworkClient {
             return TokenStatus.USED
         }
         
-        // 4. Check LIMITED
+        // 4. Check LIMITED (request limited)
         if (normalized.contains("request limited", ignoreCase = true)) {
             return TokenStatus.LIMITED
         }
